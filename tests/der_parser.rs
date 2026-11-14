@@ -626,3 +626,156 @@ fn tc_der_slice(i: &[u8], out: Result<&[u8], BerError>) {
         }
     }
 }
+
+// ----- strict DER validation -----
+
+fn strict_err(i: &[u8]) -> DerStrictError {
+    parse_der_strict(i).expect_err("strict validation should fail")
+}
+
+#[test]
+fn test_der_strict_valid() {
+    // primitive objects
+    assert!(parse_der_strict(&hex!("02 03 01 00 01")).is_ok());
+    assert!(parse_der_strict(&hex!("01 01 ff")).is_ok());
+    assert!(parse_der_strict(&hex!("05 00")).is_ok());
+    assert!(parse_der_strict(&hex!("02 01 80")).is_ok()); // -128, minimal
+    assert!(parse_der_strict(&hex!("02 02 00 80")).is_ok()); // 128, leading 0x00 required
+    assert!(parse_der_strict(&hex!("02 02 ff 7f")).is_ok()); // -129, leading 0xff required
+                                                             // minimal long-form length (128 bytes)
+    let mut v = vec![0x04, 0x81, 0x80];
+    v.extend_from_slice(&[0x41; 128]);
+    assert!(parse_der_strict(&v).is_ok());
+    // recursive containers: SEQUENCE { INTEGER, SET { INTEGER, INTEGER } }
+    let bytes = hex!("30 0b 02 01 01 31 06 02 01 01 02 01 02");
+    let obj = parse_der_strict(&bytes).expect("strict validation failed");
+    assert_eq!(obj.header.tag(), Tag::Sequence);
+    // explicit tagged object (constructed context-specific)
+    assert!(parse_der_strict(&hex!("a0 03 02 01 05")).is_ok());
+    // SET sorted by tag: BOOLEAN < INTEGER in lexicographic order of encodings
+    assert!(parse_der_strict(&hex!("31 06 01 01 ff 02 01 01")).is_ok());
+    // validate_der_strict agrees
+    assert!(validate_der_strict(&bytes).is_ok());
+}
+
+#[test]
+fn test_der_strict_non_minimal_length() {
+    // long form used for length < 128
+    let err = strict_err(&hex!("02 81 01 2a"));
+    assert_eq!(err.kind, DerStrictErrorKind::NonMinimalLength);
+    assert_eq!(err.offset, 1);
+    // long form with leading zero length octet
+    let mut v = vec![0x04, 0x82, 0x00, 0x80];
+    v.extend_from_slice(&[0x41; 128]);
+    let err = strict_err(&v);
+    assert_eq!(err.kind, DerStrictErrorKind::NonMinimalLength);
+    assert_eq!(err.offset, 1);
+    // nested: SEQUENCE { INTEGER with non-minimal length }
+    let err = strict_err(&hex!("30 04 02 81 01 2a"));
+    assert_eq!(err.kind, DerStrictErrorKind::NonMinimalLength);
+    assert_eq!(err.offset, 3);
+    // indefinite length
+    let err = strict_err(&hex!("24 80 04 01 41 00 00"));
+    assert_eq!(err.kind, DerStrictErrorKind::IndefiniteLength);
+    assert_eq!(err.offset, 1);
+    // the lenient parser still accepts these
+    assert!(parse_der(&hex!("02 81 01 2a")).is_ok());
+}
+
+#[test]
+fn test_der_strict_integer_leading_bytes() {
+    // redundant leading 0x00
+    let err = strict_err(&hex!("02 02 00 7f"));
+    assert_eq!(err.kind, DerStrictErrorKind::IntegerLeadingBytes);
+    assert_eq!(err.offset, 2);
+    // redundant leading 0xff
+    let err = strict_err(&hex!("02 02 ff 80"));
+    assert_eq!(err.kind, DerStrictErrorKind::IntegerLeadingBytes);
+    assert_eq!(err.offset, 2);
+    // nested inside a SEQUENCE
+    let err = strict_err(&hex!("30 07 02 01 01 02 02 00 7f"));
+    assert_eq!(err.kind, DerStrictErrorKind::IntegerLeadingBytes);
+    assert_eq!(err.offset, 7);
+    // empty INTEGER
+    let err = strict_err(&hex!("02 00"));
+    assert_eq!(err.kind, DerStrictErrorKind::InvalidContent);
+    // the lenient parser accepts the redundant 0xff form
+    assert!(parse_der(&hex!("02 02 ff 80")).is_ok());
+}
+
+#[test]
+fn test_der_strict_constructed_encoding() {
+    // constructed OCTET STRING (primitive type)
+    let err = strict_err(&hex!("24 03 04 01 41"));
+    assert_eq!(err.kind, DerStrictErrorKind::ConstructedEncoding);
+    assert_eq!(err.offset, 0);
+    // primitive SEQUENCE (constructed type)
+    let err = strict_err(&hex!("10 00"));
+    assert_eq!(err.kind, DerStrictErrorKind::ConstructedEncoding);
+    assert_eq!(err.offset, 0);
+    // primitive SET
+    let err = strict_err(&hex!("11 00"));
+    assert_eq!(err.kind, DerStrictErrorKind::ConstructedEncoding);
+    // constructed BIT STRING
+    let err = strict_err(&hex!("23 03 03 01 00"));
+    assert_eq!(err.kind, DerStrictErrorKind::ConstructedEncoding);
+}
+
+#[test]
+fn test_der_strict_unordered_set() {
+    // SET { 2, 1 }: not sorted
+    let err = strict_err(&hex!("31 06 02 01 02 02 01 01"));
+    assert_eq!(err.kind, DerStrictErrorKind::UnorderedSet);
+    assert_eq!(err.offset, 5);
+    // SET sorted by tag: INTEGER before BOOLEAN is wrong order
+    let err = strict_err(&hex!("31 06 02 01 01 01 01 ff"));
+    assert_eq!(err.kind, DerStrictErrorKind::UnorderedSet);
+    assert_eq!(err.offset, 5);
+    // unordered SET nested in a SEQUENCE
+    let err = strict_err(&hex!("30 08 31 06 02 01 02 02 01 01"));
+    assert_eq!(err.kind, DerStrictErrorKind::UnorderedSet);
+    assert_eq!(err.offset, 7);
+    // SET OF (same tag): unordered INTEGERs
+    let err = strict_err(&hex!("31 09 02 01 03 02 01 02 02 01 01"));
+    assert_eq!(err.kind, DerStrictErrorKind::UnorderedSet);
+    assert_eq!(err.offset, 5);
+    // the lenient parser accepts unordered sets
+    assert!(parse_der(&hex!("31 06 02 01 02 02 01 01")).is_ok());
+}
+
+#[test]
+fn test_der_strict_trailing_bytes() {
+    let err = strict_err(&hex!("02 01 01 00"));
+    assert_eq!(err.kind, DerStrictErrorKind::TrailingBytes);
+    assert_eq!(err.offset, 3);
+    // the lenient parser accepts and returns the remainder
+    let (rem, _) = parse_der(&hex!("02 01 01 00")).expect("parsing failed");
+    assert_eq!(rem, &[0x00]);
+}
+
+#[test]
+fn test_der_strict_other_errors() {
+    // truncated input
+    let err = strict_err(&hex!("02 02 01"));
+    assert_eq!(err.kind, DerStrictErrorKind::Truncated);
+    let err = strict_err(&[]);
+    assert_eq!(err.kind, DerStrictErrorKind::Truncated);
+    // invalid BOOLEAN value
+    let err = strict_err(&hex!("01 01 7f"));
+    assert_eq!(err.kind, DerStrictErrorKind::InvalidContent);
+    // recursion limit
+    let mut v = vec![0x05, 0x00];
+    for _ in 0..60 {
+        let len = v.len();
+        let mut w = vec![0x30, len as u8];
+        w.append(&mut v);
+        v = w;
+    }
+    let err = strict_err(&v);
+    assert_eq!(err.kind, DerStrictErrorKind::RecursionLimit);
+    // error display shows category and offset
+    let err = strict_err(&hex!("02 01 01 00"));
+    let s = format!("{}", err);
+    assert!(s.contains("trailing bytes"));
+    assert!(s.contains('3'));
+}

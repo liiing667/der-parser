@@ -59,9 +59,11 @@ pub use asn1_rs::Tag;
 
 mod multi;
 mod parser;
+mod strict;
 mod tagged;
 pub use crate::der::multi::*;
 pub use crate::der::parser::*;
+pub use crate::der::strict::*;
 pub use crate::der::tagged::*;
 
 use alloc::boxed::Box;
